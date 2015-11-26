@@ -12,7 +12,7 @@ Check if Python pip is installed:
 
     pip -h
 
-If pip is not installed, follow the installation instructions given here: [http://www.pip-installer.org/en/latest/installing.html]()
+If pip is not installed, follow [these installation instructions](https://pip.pypa.io/en/latest/installing/).
 
 Install the API server software using pip:
 
