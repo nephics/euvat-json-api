@@ -20,7 +20,7 @@ Install the API server software using pip:
 
 Start the server:
 
-    /usr/local/bin/euvat
+    /usr/local/bin/euvat-json-api
 
 You can start validating EU VAT numbers with the JSON API right away.
 
@@ -35,7 +35,7 @@ Configure your new API server start automatically after reboot, e.g., using [the
 You can change the port of the server, and other options, via the command line.
 See available command line options:
 
-    /usr/local/bin/euvat --help
+    /usr/local/bin/euvat-json-api --help
 
 When starting, the server checks for a configuration file at:
 
@@ -209,7 +209,7 @@ Example:
 
 ## Copyright and License
 
-euvat-json-api - JSON API for European VAT number validation
+euvat-json-api - JSON API for European VAT number validation  
 Copyright (c) 2010-2015 Nephics AB, Jacob Söndergaard.  
 Licensed under the Apache License, Version 2.0
 

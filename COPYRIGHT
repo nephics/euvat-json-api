@@ -1,5 +1,4 @@
-JSON API server for EU VAT number validation
-
+euvat-json-api - JSON API for European VAT number validation  
 Copyright (c) 2010-2015 Nephics AB, Jacob Söndergaard
 
 Licensed under the Apache License, Version 2.0 (the "License");

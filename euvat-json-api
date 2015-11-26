@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding=utf-8
-"""JSON API server for EU VAT number validation.
+"""euvat-json-api - JSON API for European VAT number validation.
 
 The server acts as a proxy to the EU Vies VAT check SOAP service.
 
