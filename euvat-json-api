@@ -1,0 +1,795 @@
+#!/usr/bin/env python
+# coding=utf-8
+"""JSON API server for EU VAT number validation.
+
+The server acts as a proxy to the EU Vies VAT check SOAP service.
+
+The server may retry a failed request a number of times, before (on repeated
+failure) returning an error to the client.
+
+Copyright (c) 2010-2015 Nephics AB, Jacob Söndergaard
+Licensed under the Apache License, Version 2.0
+"""
+
+import datetime
+import logging
+import os.path
+import re
+import signal
+import sqlite3
+import sys
+import time
+
+import xml.etree.cElementTree as ElementTree
+
+import tornado.web
+import tornado.httpclient
+import tornado.httpserver
+
+from tornado.concurrent import Future
+from tornado.escape import json_decode, json_encode, to_unicode
+from tornado.gen import coroutine, Return, Task
+from tornado.httputil import responses
+from tornado.ioloop import IOLoop
+from tornado.options import (define, options, parse_config_file,
+                             parse_command_line)
+
+
+__version__ = '2.3.1'
+
+#
+# Utility functions for starting and shutting down a Tornado server
+#
+
+define('port', default=8040, help='run on the given port', type=int)
+define('debug', default=False, help='run in debug mode', type=bool)
+define('cache', default=None, help='path to cache file (default no cache)',
+       type=str)
+
+
+# regex for valid characters in a VAT number
+vat_re = re.compile('^[a-zA-Z0-9]*$')
+
+
+def load_options(config_path=None, **kwargs):
+    """Load options available from kwargs, config file and command line."""
+    # load options from file
+    if config_path and os.path.isfile(config_path):
+        parse_config_file(config_path)
+    # override options with keyword arguments
+    for k, v in kwargs.items():
+        setattr(options, k, v)
+    # override anything with command line args
+    parse_command_line()
+
+
+def handle_signals(http_server, shutdown_callback=None):
+    """Make the http server shutdown on SIGINT and SIGTERM"""
+
+    def signal_handler(*args):
+        # handle SIGTERM (kill) and SIGINT (Ctrl-C) signals
+
+        if state.get('shutdown'):
+            # shutdown is in progress
+            return
+        state['shutdown'] = True
+
+        io_loop = IOLoop.current()
+
+        def shutdown():
+            if shutdown_callback:
+                shutdown_callback()
+            io_loop.stop()
+            logging.info('Shutdown completed')
+            sys.exit(0)
+
+        logging.info('Initiating shutdown')
+
+        # stop accepting requests
+        http_server.stop()
+
+        # wait 1 sec for requests to finish, then die
+
+        io_loop.add_timeout(io_loop.time() + 1, shutdown)
+
+    state = {}
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+
+def run_server(handlers, **kwargs):
+    kwargs.setdefault('debug', options.debug)
+    application = tornado.web.Application(handlers, **kwargs)
+    http_server = tornado.httpserver.HTTPServer(
+        application, xheaders=not options.debug)
+    http_server.listen(options.port)
+    logging.info('Starting server at port %d' % options.port)
+    if options.debug:
+        logging.debug('Running in debug mode')
+
+    # make the server stop on SIGINT and SIGTERM
+    handle_signals(http_server, kwargs.get('shutdown_callback'))
+
+    IOLoop.instance().start()
+
+
+def parse_date(s):
+    """Parse a string with an xsd:date and returns a datetime.date object.
+
+    Supported formats:
+        - YYYY-MM-DD
+        - YYYY-MM-DD(z|Z)
+        - YYYY-MM-DD+06:00
+        - YYYY-MM-DD-06:00
+    """
+    try:
+        year, month, day = s[:10].split('-', 2)
+        year = int(year)
+        month = int(month)
+        day = int(day)
+        return datetime.date(year, month, day)
+    except:
+        raise ValueError('Invalid date format "{}"'.format(s))
+
+
+class Bunch:
+    """Create a bunch to group a few variables.
+
+    Undefined attributes have the default value of None.
+    """
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+    def __getattr__(self, name):
+        return None
+
+#
+#  Requesthandler
+#
+
+
+class EUVatHandler(tornado.web.RequestHandler):
+
+    country_codes = ['AT', 'BE', 'BG', 'CY', 'CZ', 'DE', 'DK', 'EE', 'EL',
+                     'ES', 'FI', 'FR', 'GB', 'HR', 'HU', 'IE', 'IT', 'LT',
+                     'LU', 'LV', 'MT', 'NL', 'PL', 'PT', 'RO', 'SE', 'SI',
+                     'SK']
+
+    index_html = """
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>JSON API for European VAT number validation</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <style>
+        /*! normalize.css v2.0.1 | MIT License | git.io/normalize */article,aside,details,figcaption,figure,footer,header,hgroup,nav,section,summary{display:block}audio,canvas,video{display:inline-block}audio:not([controls]){display:none;height:0}[hidden]{display:none}html{font-family:sans-serif;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%}body{margin:0}a:focus{outline:thin dotted}a:active,a:hover{outline:0}h1{font-size:2em}abbr[title]{border-bottom:1px dotted}b,strong{font-weight:bold}dfn{font-style:italic}mark{background:#ff0;color:#000}code,kbd,pre,samp{font-family:monospace,serif;font-size:16px;line-height:1.25em}pre{white-space:pre;white-space:pre-wrap;word-wrap:break-word}q{quotes:"\201C" "\201D" "\2018" "\2019"}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sup{top:-0.5em}sub{bottom:-0.25em}img{border:0}svg:not(:root){overflow:hidden}figure{margin:0}fieldset{border:1px solid #c0c0c0;margin:0 2px;padding:.35em .625em .75em}legend{border:0;padding:0}button,input,select,textarea{font-family:inherit;font-size:100%;margin:0}button,input{line-height:normal}button,html input[type="button"],input[type="reset"],input[type="submit"]{-webkit-appearance:button;cursor:pointer}button[disabled],input[disabled]{cursor:default}input[type="checkbox"],input[type="radio"]{box-sizing:border-box;padding:0}input[type="search"]{-webkit-appearance:textfield;-moz-box-sizing:content-box;-webkit-box-sizing:content-box;box-sizing:content-box}input[type="search"]::-webkit-search-cancel-button,input[type="search"]::-webkit-search-decoration{-webkit-appearance:none}button::-moz-focus-inner,input::-moz-focus-inner{border:0;padding:0}textarea{overflow:auto;vertical-align:top}table{border-collapse:collapse;border-spacing:0}body{font-size:16px;font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;line-height:1.375em;color:#333;background:#fff}section,footer{margin-right:auto;margin-left:auto;margin-top:50px;max-width:650px;padding:0 10px}footer{color:#589977;font-size:14px;line-height:1.2em;margin-bottom:25px}code{font-size:15px;font-weight:600}a,h1,h2,h3,h4{color:#1b585c;line-height:1em}h1{font-size:28px;font-weight:600;padding-right:5px}h2{font-size:20px;margin-top:28px}h3{font-size:16px;margin-top:18px}.space-above{margin-top:45px}form,.space-below{margin-bottom:45px}
+      </style>
+    </head>
+    <body>
+      <section>
+        <h1>JSON API for European VAT number validation</h1>
+
+        <p>This server provides a web developer friendly JSON API, making it simple for you to perform European VAT number validation.</p>
+        <p>The server acts as <strong>a robust layer between your app and VIES</strong>, and by <strong>automatically retrying failed requests multiple times</strong>, you will experience fewer failed VAT validation requests than with direct requests to the VIES SOAP service.</p>
+
+        <h2>The JSON API</h2>
+        <p>The API is simple: Send a HTTP request to <code>http://{% server %}/&lt;VAT&nbsp;number&gt;</code>, and you will receive a JSON encoded reply containing the response from VIES.</p>
+        <p>See examples of requests and responses below.</p>
+
+        <h3>Choose between direct or async request</h3>
+        <p>The API gives you the choice to either 1) wait for the server to reply with the VAT response, or 2) get an asynchronous callback to your server, when the response is available from VIES.</p>
+
+        <p>The first option is great for front-end code (running in the browser) or for simple server-side request handling, where you don't have the option or infrastructure for receiving a HTTP callback.</p>
+
+        <p>The second (async) option is better for a server-side VAT lookup during payment processing, or when you are running an async web server like Node.js or Tornado.</p>
+
+        <p>The async option has one major advantage, namely that the callback to your server will occur when the VAT response is ready from VIES. Hence, if VIES is down or not responding, the API server will wait for VIES to get back online, before retrying the request and making the callback to your server.</p>
+
+        <p>It happens regularly that VIES is down, though often for shorter periods. Hence, the async option provides a much higher certainty for getting the VAT response from VIES instead of an error message.</p>
+
+        <h3>Making a direct request</h3>
+
+        <p>Send a HTTP GET request to <code>http://{% server %}/&lt;VAT&nbsp;number&gt;</code>, and you will receive a JSON encoded reply containing the response from VIES.</p>
+
+        <p>You can (optionally) include the <code>jsonp</code> query parameter to receive a JSONP response, i.e., a response with content type <code>application/javascript</code> performing a custom callback with the result.</p>
+
+        <h3>Making an async request (advanced use)</h3>
+
+        <p>Send a HTTP POST request to <code>http://{% server %}/&lt;VAT number&gt;</code> and with callback URL in the body, and the specified URL will receive a HTTP POST request with the JSON encoded response from VIES.</p>
+
+        <h2 class="space-above">Example requests</h2>
+
+        <h3 class="space-above">Example request for validating a VAT number</h3>
+        <p>Send a HTTP GET request to the URL:<br>
+        <a rel="nofollow" href="http://{% server %}/SE502070882101" target="_blank">http://{% server %}/SE502070882101</a>
+        </p>
+
+        <p>The following response is returned (formatted for readability):</p>
+        <pre>
+      {
+        "name": "APPLE DISTRIBUTION INTERNATIONAL",
+        "countryCode": "SE",
+        "vatNumber": "502070882101",
+        "valid": true,
+        "requestDate": "2015-11-26",
+        "address": "HOLLYHILL INDUSTRIAL ESTATE, HOLLY- \\nHILL, CO. CORK. ATT MARIE NIESEN \\nIRLAND",
+        "requestStats": {
+          "retries": 0,
+          "total": 0.48,
+          "request": 0.48,
+          "queued": 0.0
+        }
+      }</pre>
+
+        <p>If the VAT number is invalid the response will contain <code>valid = false</code>, as seen here, trying to validate VAT number "GB0000000":<p>
+        <pre>
+      {
+        "valid": false,
+        "requestDate": "2015-11-26",
+        "countryCode": "GB",
+        "vatNumber": "0000000",
+        "requestStats": {
+            "total": 0.1,
+            "retries": 0,
+            "queued": 0.0,
+            "request": 0.1
+        }
+      }</pre>
+
+        <p>The <code>requestStats</code> object provides some performance statistics for the request:</p>
+        <ul>
+          <li><code>queued</code>: Seconds in queue before submitting request to VIES</li>
+          <li><code>retries</code>: Number of retries (>0 when VIES is down or busy)</li>
+          <li><code>request</code>: Duration (seconds) of request to VIES (incl. waiting between retries)</li>
+          <li><code>total</code>: Total duration (seconds) of request on server.</li>
+        </ul>
+
+        <p>If the VIES service is down, a HTTP 50x error response is returned with a description of the error. For example:</p>
+        <pre>
+      {"code": 503, "error": "Member State service unavailable."}</pre>
+
+        <p>If the request is malformed, e.g. missing country code, a HTTP 400 error response is returned with a description of the error. For example:</p>
+          <pre>
+      {"code": 400, "error": "Invalid country code."}</pre>
+
+        <h3 class="space-above">Example JSONP request for validating a VAT number</h3>
+        <p>Send a HTTP GET request to the URL:<br>
+        <a rel="nofollow" href="http://{% server %}/SE502070882101?jsonp=myfunc" target="_blank">http://{% server %}/SE502070882101?<strong>jsonp</strong>=myfunc</a></p>
+
+        <p>Response (formatted for readability):</p>
+        <pre>
+      myfunc({
+        "name": "APPLE DISTRIBUTION INTERNATIONAL",
+        "countryCode": "SE",
+        "vatNumber": "502070882101",
+        "valid": true,
+        "requestDate": "2015-11-26",
+        "address": "HOLLYHILL INDUSTRIAL ESTATE, HOLLY- \\nHILL, CO. CORK. ATT MARIE NIESEN \\nIRLAND",
+        "requestStats": {
+          "retries": 0,
+          "total": 1.71,
+          "request": 1.71,
+          "queued": 0.0
+        }
+      })</pre>
+
+        <h2 class="space-above">Questions and Answers</h2>
+
+        <h3>What are the valid country codes?</h3>
+          <p>The European VAT numbers that can be validated using this API starts with one of these two letter country codes:
+          </p>
+          <pre>
+        countries = {
+          "AT": "Austria",
+          "BE": "Belgium",
+          "BG": "Bulgaria",
+          "CY": "Cyprus",
+          "CZ": "Czech Republic",
+          "DE": "Germany",
+          "DK": "Denmark",
+          "EE": "Estonia",
+          "EL": "Greece",
+          "ES": "Spain",
+          "FI": "Finland",
+          "FR": "France",
+          "GB": "United Kingdom",
+          "HR": "Croatia",
+          "HU": "Hungary",
+          "IE": "Ireland",
+          "IT": "Italy",
+          "LT": "Lithuania",
+          "LU": "Luxembourg",
+          "LV": "Latvia",
+          "MT": "Malta",
+          "NL": "The Netherlands",
+          "PL": "Poland",
+          "PT": "Portugal",
+          "RO": "Romania",
+          "SE": "Sweden",
+          "SI": "Slovenia",
+          "SK": "Slovakia"
+        }
+            </pre>
+
+
+        <h3>Are VAT validation requests cached?</h3>
+        <p>VAT replies are cached when the server is started with the <code>--cache=/path/to/cache/</code> command line argument.</p>
+        <p>When caching is enabled and a cached result exists that is not older than 24 hours, the cached result is returned, and the response will contain <code>cachedResult=true</code>.</p>
+        <p>You can get the cached result, even when it is older than 24 hours, by setting the query parameter <code>stale_ok=true</code>.
+        <br>Example:<br>
+        <a rel="nofollow" href="http://{% server %}/SE502070882101?stale_ok=true" target="_blank">http://{% server %}/SE502070882101?stale_ok=true</a>
+        </p>
+
+        <p>You can force the server to perform the request, even if a cached result exists, by setting the query parameter <code>no_cache=true</code>.
+        <br>Example:<br>
+        <a rel="nofollow" href="http://{% server %}/SE502070882101?no_cache=true" target="_blank">http://{% server %}/SE502070882101?no_cache=true</a>
+        </p>
+      </section>
+
+      <footer>
+        <p>euvat-json-api - JSON API for European VAT number validation
+        <br>Copyright (c) 2010-2015 Nephics AB, Jacob Söndergaard.
+        <br>Licensed under the Apache License, Version 2.0
+        <p>Source code available at <a href="https://github.com/nephics/euvat-json-api">https://github.com/nephics/euvat-json-api</a>.
+      </footer>
+    </body>
+    </html>
+    """
+
+    def write_error(self, status_code, **kwargs):
+        self.finish({
+            'error': kwargs.get('msg') or responses[status_code]
+        })
+
+    def options(self):
+        self.set_status(405)
+
+    def head(self):
+        self.render('index.html')
+
+    @coroutine
+    def get(self, vat):
+        """Show homepage or perform sync. VAT lookup"""
+        vat = vat.upper().replace(' ', '')
+        jsonp = self.get_argument('jsonp', '')
+
+        if not vat:
+            self.finish(self.index_html.replace(
+                '{% server %}', '127.0.0.1:{}'.format(options.port)))
+        else:
+            result = yield self.check_vat(vat)
+            if jsonp:
+                self.set_header('Content-Type', 'application/javascript')
+                self.finish('{}({})'.format(jsonp, json_encode(result)))
+            else:
+                if 'error' in result:
+                    self.set_status(result['code'])
+                self.finish(result)
+
+    @coroutine
+    def post(self, vat):
+        """Async VAT lookup"""
+        vat = vat.upper().replace(' ', '')
+        url = to_unicode(self.request.body)
+
+        if not vat:
+            self.send_error(400, msg='Missing VAT no')
+
+        elif not url:
+            self.send_error(400, msg='Missing callback URL')
+
+        else:
+            result = yield self.check_vat(
+                vat, async=True, url=url)
+            if 'error' in result:
+                self.send_error(result['code'], msg=result['error'])
+            else:
+                # tell the client that we got the request, and we'll call back
+                self.set_status(result['code'])
+                self.finish()
+
+    @coroutine
+    def check_vat(self, vat, async=False, url=None):
+        if not vat_re.match(vat):
+            raise Return({'code': 400,
+                          'error': 'Invalid characters in VAT number'})
+        if len(vat) < 7 or len(vat) > 20:
+            raise Return({'code': 400,
+                          'error': 'Invalid length of VAT number'})
+        elif vat[:2] not in self.country_codes:
+            raise Return({'code': 400, 'error': 'Invalid country code'})
+        elif async and not self.check_url(url):
+            raise Return({'code': 400, 'error': 'Invalid callback URL'})
+
+        no_cache = bool(self.get_argument('no_cache', False))
+        stale_ok = bool(self.get_argument('stale_ok', False))
+
+        data = {
+            'vat': vat,
+            'async': async,
+            'no_cache': no_cache,
+            'stale_ok': stale_ok,
+            'stats': {'start': self.request._start_time}
+        }
+        if async:
+            data['url'] = url
+
+        # queue the job
+        future = self.settings['worker'].submit(data)
+
+        if async:
+            raise Return({'code': 202})
+        else:
+            result = yield future
+            raise Return(result)
+
+    def check_url(self, url):
+        """Check client's server URL for common mistakes.
+
+        Returns True if the URL seems ok, returns False otherwise.
+        """
+        if not url:
+            return False
+        try:
+            usp = tornado.web.urlparse.urlsplit(url)
+        except Exception as e:
+            logging.warning(e)
+            return False
+        else:
+            if usp.scheme not in ('http', 'https') or not usp.netloc:
+                return False
+        return True
+
+
+class Worker:
+
+    # seconds before a sync job is timed out from the queue
+    sync_timeout = 30.0
+
+    # maximum number of retries for any single job
+    max_retries = 100
+
+    # min. seconds to wait between retries when EU VIES server is down
+    # (if there are only async jobs, wait time is 12 times longer)
+    error_wait = 5
+
+    request_url = "http://ec.europa.eu/taxation_customs/vies/services/checkVatService"
+
+    xml_request_template = """<?xml version="1.0" encoding="UTF-8"?><SOAP-ENV:Envelope xmlns:ns0="urn:ec.europa.eu:taxud:vies:services:checkVat:types" xmlns:ns1="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><SOAP-ENV:Header/><ns1:Body><ns0:checkVat><ns0:countryCode>{country_code}</ns0:countryCode><ns0:vatNumber>{vat_no}</ns0:vatNumber></ns0:checkVat></ns1:Body></SOAP-ENV:Envelope>"""
+
+    def __init__(self, io_loop=None):
+        self._init_db()
+        self.io_loop = io_loop or tornado.ioloop.IOLoop.current()
+        self._running = False
+        self._shutdown = False
+        self.sync_queue = []
+        self.async_queue = []
+        self.http = tornado.httpclient.AsyncHTTPClient()
+
+    def _init_db(self):
+        filepath = options.cache
+        self.db = None
+        if filepath is None:
+            logging.debug('No cache database')
+            return
+        is_new = False
+        if not os.path.basename(filepath):
+            # add a filename to the path
+            filepath = os.path.join(filepath, 'euvat.db')
+        if not os.path.exists(filepath):
+            try:
+                open(filepath, 'w').close()
+            except IOError:
+                logging.error('Cache file "{}" cannot be created '
+                              '(check file read/write permissions).'
+                              .format(filepath))
+                return
+            else:
+                is_new = True
+
+        logging.debug('Cache database file: {}'.format(filepath))
+        db = sqlite3.connect(filepath, detect_types=sqlite3.PARSE_DECLTYPES)
+        db.row_factory = sqlite3.Row
+        sqlite3.register_adapter(dict, json_encode)
+        sqlite3.register_converter('json', json_decode)
+        if is_new:
+            c = db.cursor()
+            c.execute("create table vat_results (vatno text primary key, "
+                      "date date, result json)")
+            db.commit()
+        else:
+            # Compact the database
+            before = os.stat(filepath).st_size
+            db.execute('VACUUM')
+            db.commit()
+            after = os.stat(filepath).st_size
+            logging.debug('Saved {} bytes when compacting the cache database'
+                          .format(before - after))
+
+        self.db = db
+
+    def _cache_get(self, vat_no):
+        """Fetch VAT reply from cache db"""
+        if self.db is None:
+            return None
+        c = self.db.cursor()
+        c.execute('select * from vat_results where vatno=?', (vat_no,))
+        r = c.fetchone()
+        return r
+
+    def _cache_put(self, vat_no, result):
+        """Fetch VAT reply from cache db"""
+        if self.db is None:
+            return
+        c = self.db.cursor()
+        c.execute('insert or replace into vat_results values (?, ?, ?)',
+                  (vat_no, datetime.date.today(), result))
+        self.db.commit()
+
+    def submit(self, data):
+        future = Future()
+
+        if data['async']:
+            queue = self.async_queue
+            async_callback = lambda r: self.io_loop.add_future(
+                self._async_cb(data['url'], r),
+                lambda f: f.result())
+            self.io_loop.add_future(future, async_callback)
+        else:
+            queue = self.sync_queue
+
+        if data.get('no_cache'):
+            cached = None
+        else:
+            cached = self._cache_get(data['vat'])
+
+        if cached is not None:
+            # cache hit!
+            if data.get('stale_ok') or (datetime.date.today() -
+                                        cached['date']).days < 2:
+                # return result right away
+                resp = cached['result']
+                resp['requestStats'] = self._make_stats(data)
+                resp['cachedResult'] = True
+                future.set_result(resp)
+                return future
+
+            # we may return the cached results later (if VIES is down)
+            data['cached'] = cached['result']
+
+        queue.append((time.time(), data, future))
+        self.io_loop.add_future(self._run(), lambda f: f.result())
+        return future
+
+    def shutdown(self, timeout=None):
+        """Shutdown the worker, waiting for jobs to finish."""
+        future = Future()
+        self._shutdown = future
+
+        @coroutine
+        def stop():
+            yield [self._run(), future]
+            if self.db is not None:
+                self.db.close()
+
+        io_loop = tornado.ioloop.IOLoop()
+        try:
+            io_loop.run_sync(stop, timeout or 1)
+        except tornado.ioloop.TimeoutError:
+            logging.warning("Forced worker shutdown due to timeout")
+
+    @coroutine
+    def _run(self, looping=False):
+        if self._running and not looping:
+            return
+        if self._shutdown:
+            self._shutdown.set_result(True)
+            return
+        if len(self.sync_queue) + len(self.async_queue) == 0:
+            # no more work in queues
+            self._running = False
+            return
+        self._running = True
+        failed = yield self._run_next()
+        self._purge_queue()
+        if failed and not self._shutdown:
+            # wait before sending new request to VIES
+            seconds = self.error_wait * (1 if self.sync_queue else 12)
+            yield Task(self.io_loop.add_timeout,
+                       datetime.timedelta(seconds=seconds))
+        # loop around
+        self.io_loop.add_future(self._run(True), lambda f: f.result())
+
+    @coroutine
+    def _run_next(self):
+        if self.sync_queue:
+            queue = self.sync_queue
+        else:
+            queue = self.async_queue
+        ts, data, ftr = queue[0]
+        if 'request' not in data['stats']:
+            data['stats']['request'] = time.time()
+        resp = yield self._work(data)
+        failed = 'error' in resp
+        if not failed or data.get('retries', 0) > self.max_retries:
+            queue.pop(0)
+            if failed and 'cached' in data:
+                resp = data['cached']
+                resp['cachedResult'] = True
+            resp['requestStats'] = self._make_stats(data)
+            ftr.set_result(resp)
+        else:
+            data['retries'] = data.get('retries', 0) + 1
+            data['last_resp'] = resp
+        raise Return(failed)
+
+    def _purge_queue(self):
+        """Expire (sync) jobs that have timed out"""
+        now = time.time()
+        remaining = []
+        for ts, data, ftr in self.sync_queue:
+            if now - ts >= self.sync_timeout:
+                if 'cached' in data:
+                    resp = data['cached']
+                    resp['cachedResult'] = True
+                else:
+                    resp = data.get(
+                        'last_resp',
+                        {'code': 503,
+                         'error': "Member State service unavailable."})
+                resp['requestStats'] = self._make_stats(data)
+                ftr.set_result(resp)
+            else:
+                remaining.append((ts, data, ftr))
+        self.sync_queue = remaining
+
+    def _make_stats(self, data):
+        stats = data['stats']
+        now = time.time()
+        stats['result'] = now
+        start = stats['start']
+        return {
+            'queued': round(stats.get('request', now) - start, 2),
+            'request': round(stats['result'] - stats.get('request', now), 2),
+            'total': round(time.time() - start, 2),
+            'retries': data.get('retries', 0)
+        }
+
+    @coroutine
+    def _work(self, data):
+        """Send request to VIES and process XML response"""
+        vat = data['vat']
+
+        body = self.xml_request_template.format(
+            country_code=vat[:2], vat_no=vat[2:]).encode('utf8')
+
+        try:
+            resp = yield self.http.fetch(
+                self.request_url, method='POST', body=body,
+                request_timeout=(60.0 if data['async'] else 15.0),
+                user_agent="VAT Checker")
+        except tornado.httpclient.HTTPError as e:
+            # Request failed
+            resp = e.response or Bunch(code=e.code)
+        except Exception as e:
+            # probably a socket error, e.g., DNS error
+            logging.debug(e)
+            resp = Bunch(code=599)
+
+        result = {}
+        if resp.code != 200:
+            logging.debug("Request failed with response code: {}".format(
+                resp.code))
+            if resp.body is not None:
+                logging.debug(u"Response body:\n{}".format(
+                    to_unicode(resp.body)))
+            if 500 <= resp.code < 599:
+                result['error'] = "Member State service unavailable."
+                result['code'] = 503
+            else:
+                result['error'] = "No response from the VIES server"
+                result['code'] = 504
+        else:
+            # Handle SOAP XML response received from VIES.
+            # - Parse XML and create a result object, process the result.
+            try:
+                xml_response = resp.body
+                root = ElementTree.fromstring(xml_response)
+                vatResponse = root[0][0]
+                if not vatResponse.tag.endswith('checkVatResponse'):
+                    raise ValueError("Unexpected tag name {}".format(
+                        vatResponse.tag))
+                fields = ('countryCode', 'vatNumber', 'requestDate', 'valid',
+                          'name', 'address')
+                for child in vatResponse:
+                    tag = [f for f in fields if child.tag.endswith(f)][0]
+                    if tag == 'requestDate':
+                        result[tag] = parse_date(child.text).isoformat()
+                    elif tag == 'valid':
+                        result[tag] = {'true': True, 'false': False}[
+                            child.text]
+                    else:
+                        result[tag] = child.text
+            except Exception as e:
+                logging.error(e)
+                if resp.body is not None:
+                    logging.debug(u"Response body:\n{}".format(
+                        to_unicode(resp.body)))
+                result['error'] = "Invalid response from EU VIES server"
+                result['code'] = 502
+            else:
+                self._cache_put(vat, result)
+        raise Return(result)
+
+    @coroutine
+    def _async_cb(self, url, future):
+        data = future.result()
+        stats = data['requestStats']
+        stats['delivery_retries'] = 0
+        while stats['delivery_retries'] <= 5:
+
+            delivered = yield self._deliver(url, data)
+            if delivered:
+                logging.info('Delivered to {}'.format(url))
+                return
+
+            stats['delivery_retries'] += 1
+
+            logging.warning('Failed delivery attempt {} to {}'.format(
+                stats['delivery_retries'], url))
+
+            # wait sequentially longer before trying to deliver again
+            yield Task(self.io_loop.add_timeout, datetime.timedelta(
+                seconds=5 * stats['delivery_retries']))
+
+        logging.error('Permanent delivery failure to {}'.format(url))
+
+    @coroutine
+    def _deliver(self, url, data):
+        body = json_encode(data)
+        try:
+            yield self.http.fetch(
+                url, method='POST', body=body,
+                headers={'Content-Type': 'application/json'},
+                request_timeout=60.0, user_agent="EU VAT JSON API callback")
+        except Exception as e:
+            # request failed (for any odd reason)
+            logging.debug(e)
+            raise Return(False)
+        else:
+            raise Return(True)
+
+
+def main():
+    load_options('/etc/euvat.conf')
+
+    worker = Worker()
+
+    settings = {
+        # setting the debug parameter to True allows for automatic
+        # reload on file change
+        'debug': options.debug,
+
+        # don't check POST requests for xsrf cookie
+        'xsrf_cookies': False,
+
+        # shared worker (for executing tasks in parallel threads)
+        'worker': worker,
+
+        # callback on server shutdown
+        'shutdown_callback': worker.shutdown,
+
+        # path to templates
+        'template_path': os.path.dirname(__file__)
+    }
+
+    handlers = [
+        (r'/(.*)', EUVatHandler)
+    ]
+
+    run_server(handlers, **settings)
+
+
+if __name__ == '__main__':
+    main()
