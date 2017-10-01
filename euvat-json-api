@@ -7,7 +7,7 @@ The server acts as a proxy to the EU Vies VAT check SOAP service.
 The server may retry a failed request a number of times, before (on repeated
 failure) returning an error to the client.
 
-Copyright (c) 2010-2015 Nephics AB, Jacob Söndergaard
+Copyright (c) 2010-2017 Nephics AB
 Licensed under the Apache License, Version 2.0
 """
 

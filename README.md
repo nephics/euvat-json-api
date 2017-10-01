@@ -30,7 +30,7 @@ If you have [cURL](http://curl.haxx.se/) installed, you can validate a VAT numbe
 
 Stop the server with Ctrl+C, or by sending a SIGTERM signal.
 
-Configure your new API server start automatically after reboot, e.g., using [these instructions](http://jacobsondergaard.com/blog/make-your-server-process-run-forever/).
+Configure your new API server start automatically after reboot, e.g., using [these instructions](http://blog.nephics.com/2014/01/22/make-your-server-process-run-forever/).
 
 You can change the port of the server, and other options, via the command line.
 See available command line options:
@@ -192,7 +192,7 @@ The European VAT numbers that can be validated using this API starts with one of
 
 ### Are VAT validation requests cached?
 
-VAT replies are cached when the server is started with the --cache=/path/to/cache/ command line argument.
+VAT replies are cached when the server is started with the `--cache=/path/to/cache/` command line argument.
 
 When caching is enabled and a cached result exists that is not older than 24 hours, the cached result is returned, and the response will contain cachedResult=true.
 
@@ -206,11 +206,14 @@ Example:
 
     http://127.0.0.1:8040/SE502070882101?no_cache=true
 
+## Support
+
+Support for the software can be provided on a commercial basis, please see [www.nephics.com](https://www.nephics.com) for contact information.
 
 ## Copyright and License
 
 euvat-json-api - JSON API for European VAT number validation  
-Copyright (c) 2010-2015 Nephics AB, Jacob Söndergaard.  
+Copyright (c) 2010-2017 Nephics AB
 Licensed under the Apache License, Version 2.0
 
 Source code available at <a href="https://github.com/nephics/euvat-json-api">https://github.com/nephics/euvat-json-api</a>.
